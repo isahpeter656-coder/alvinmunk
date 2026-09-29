@@ -68,7 +68,7 @@ export interface Vouch {
 }
 
 /** Mirror of the on-chain `Profile` struct — all of `get_profile`, nothing else. Frozen
- *  (docs/ON_CHAIN_EVENTS.md): Soroban decodes a struct only when the returned vec has
+ *  (docs/ON_CHAIN_EVENTS.md): Soroban decodes a struct only when the returned map has
  *  exactly its fields, so new per-address data ships as its own view, like `get_counts`. */
 export interface Profile {
   /** Social XP — leaderboard/fun, never cashable */
@@ -80,13 +80,12 @@ export interface Profile {
 }
 
 /**
- * The DECLARATION order of each mirror's fields, which is the order Soroban puts them on
- * the wire. `#[contracttype]` structs encode as `ScVal::Vec`, and `scValToNative` — the
- * decode every JS consumer already calls — returns a bare vec as a POSITIONAL array, never
- * an object: a vec carries no field names, so the SDK cannot invent any. These lists are
- * therefore the only thing binding these interfaces to the contracts, which is why
- * `decodeVouch`/`decodeProfile` apply them instead of trusting the caller, and why
- * `apps/web/src/lib/contract-shapes.test.ts` diffs them against `lib.rs`.
+ * Every field of each mirror, in the contract's declaration order. A `#[contracttype]`
+ * struct with named fields travels as an `ScVal::Map` keyed by field name (sorted by the
+ * host), which `scValToNative` turns into a plain object with those keys: the decoders
+ * below accept exactly these keys, so a field added, dropped or renamed on either side
+ * throws instead of reading as `undefined`. `read-views.test.ts` checks the lists against
+ * `contracts/reputation/src/lib.rs` and decodes the contract's own fixtures through them.
  */
 export const VOUCH_FIELDS = [
   'id',
@@ -100,39 +99,28 @@ export const VOUCH_FIELDS = [
   'slashed',
 ] as const satisfies readonly (keyof Vouch)[];
 
-export const PROFILE_FIELDS = ['social', 'earned', 'verified'] as const satisfies readonly (
-  keyof Profile
-)[];
+export const PROFILE_FIELDS = [
+  'social',
+  'earned',
+  'verified',
+] as const satisfies readonly (keyof Profile)[];
 
-/** `Option<T>` is a one-element `Vec`: `[value]`, or `[null]` for `None`. */
-function optionField(raw: unknown, what: string): unknown {
-  return positional(raw, [what])[0] ?? null;
-}
-
-/** `BytesN<N>` is also a `Vec`, wrapping the single `Bytes` it holds. */
-function bytesField(raw: unknown, what: string): Uint8Array {
-  return Uint8Array.from(positional(raw, [what])[0] as Uint8Array);
-}
-
-/**
- * A struct vec's fields, refused unless there are exactly as many as the mirror declares.
- * That count is the cheap guard against the drift this package exists to prevent: a struct
- * that gains a field is a loud failure here, not every field after it read off the wrong
- * index.
- */
-function positional(raw: unknown, names: readonly string[]): unknown[] {
-  if (!Array.isArray(raw)) {
-    const what = names.join('/');
+/** `raw` as a struct object with exactly `fields`, or a thrown error naming the drift. */
+function structOf(raw: unknown, name: string, fields: readonly string[]): Record<string, unknown> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    const got = raw === null ? 'null' : Array.isArray(raw) ? 'an array' : typeof raw;
+    throw new Error(`${name}: expected a contract struct, got ${got}`);
+  }
+  const keys = Object.keys(raw);
+  const missing = fields.filter((f) => !keys.includes(f));
+  const extra = keys.filter((k) => !fields.includes(k));
+  if (missing.length || extra.length) {
     throw new Error(
-      `${what}: expected a Soroban struct vec, got ${raw === null ? 'null' : typeof raw}`,
+      `${name}: contract fields drifted (missing: ${missing.join(', ') || '-'}; ` +
+        `unknown: ${extra.join(', ') || '-'})`,
     );
   }
-  if (raw.length !== names.length) {
-    throw new Error(
-      `${names.join('/')}: contract returned ${raw.length} fields, expected ${names.length}`,
-    );
-  }
-  return raw;
+  return raw as Record<string, unknown>;
 }
 
 function u64Field(raw: unknown, what: string): bigint {
@@ -145,44 +133,47 @@ function stringField(raw: unknown, what: string): string {
   return raw;
 }
 
+function boolField(raw: unknown, what: string): boolean {
+  if (typeof raw !== 'boolean') throw new Error(`${what}: expected a bool, got ${typeof raw}`);
+  return raw;
+}
+
 /**
- * Decode a `get_vouch` return value — what `scValToNative` hands back for
- * `Option<Vouch>` — into {@link Vouch}, or `null` for an id that was never minted. Strict
- * on purpose: a shape that no longer matches the contract throws instead of quietly
- * reading a field off the wrong index.
+ * Decode a `get_vouch` return value, as `scValToNative` hands it back, into {@link Vouch}:
+ * `null` for `None` (an id that was never minted, which reads as `ScVal::Void`). An
+ * `Option<Address>` field is its address or `null`; a `BytesN<32>` is a 32-byte buffer.
  */
 export function decodeVouch(raw: unknown): Vouch | null {
-  const v = optionField(raw, 'Vouch');
-  if (v === null) return null;
-  const [id, from, claim_hash, note, claimed, rawClaimer, created, stake, slashed] = positional(
-    v,
-    VOUCH_FIELDS,
-  );
-  const claimer = optionField(rawClaimer, 'Vouch.claimer');
+  if (raw === null) return null;
+  const v = structOf(raw, 'Vouch', VOUCH_FIELDS);
+  const hash = v.claim_hash;
+  if (!(hash instanceof Uint8Array) || hash.length !== 32) {
+    throw new Error('Vouch.claim_hash: expected 32 bytes');
+  }
   return {
-    id: u64Field(id, 'Vouch.id'),
-    from: stringField(from, 'Vouch.from'),
-    claim_hash: bytesField(claim_hash, 'Vouch.claim_hash'),
-    note: stringField(note, 'Vouch.note'),
-    claimed: Boolean(claimed),
-    claimer: claimer === null ? null : stringField(claimer, 'Vouch.claimer'),
-    created: u64Field(created, 'Vouch.created'),
-    stake: u64Field(stake, 'Vouch.stake'),
-    slashed: Boolean(slashed),
+    id: u64Field(v.id, 'Vouch.id'),
+    from: stringField(v.from, 'Vouch.from'),
+    claim_hash: Uint8Array.from(hash),
+    note: stringField(v.note, 'Vouch.note'),
+    claimed: boolField(v.claimed, 'Vouch.claimed'),
+    claimer: v.claimer === null ? null : stringField(v.claimer, 'Vouch.claimer'),
+    created: u64Field(v.created, 'Vouch.created'),
+    stake: u64Field(v.stake, 'Vouch.stake'),
+    slashed: boolField(v.slashed, 'Vouch.slashed'),
   };
 }
 
 /**
- * Decode a `get_profile` return value — the `scValToNative` output for `Profile` — into
- * {@link Profile}. The address is the argument, never a field: `Profile` carries no
+ * Decode a `get_profile` return value, as `scValToNative` hands it back, into
+ * {@link Profile}. The address is the call's argument, never a field: `Profile` carries no
  * subject of its own.
  */
 export function decodeProfile(raw: unknown): Profile {
-  const [social, earned, verified] = positional(raw, PROFILE_FIELDS);
+  const p = structOf(raw, 'Profile', PROFILE_FIELDS);
   return {
-    social: u64Field(social, 'Profile.social'),
-    earned: u64Field(earned, 'Profile.earned'),
-    verified: Boolean(verified),
+    social: u64Field(p.social, 'Profile.social'),
+    earned: u64Field(p.earned, 'Profile.earned'),
+    verified: boolField(p.verified, 'Profile.verified'),
   };
 }
 
