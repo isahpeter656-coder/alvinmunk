@@ -11,10 +11,11 @@
  */
 import { Address, Keypair, hash, nativeToScVal, xdr } from '@stellar/stellar-sdk';
 import { buildClaimUrl } from '@alvinmunk/shared';
+import type { ProfileView, VouchView } from '@alvinmunk/sdk';
 import { invokeAndWait, readContract, readPublic, args, repId, questId } from './contracts';
+import { readClient } from './sdk';
 import { networkPassphrase } from './stellar';
 import { shareInFlight } from './utils';
-import { decodeProfile, decodeVouch, type Profile, type Vouch } from '@alvinmunk/shared';
 import type { Wallet } from './wallet';
 import { SCHEMA, type Attestation } from '@alvinmunk/shared';
 
@@ -56,33 +57,16 @@ export function clampVouchNote(input: string): string {
   return out;
 }
 
-/** Widen every `bigint` of a contract mirror to `number`: the XP totals and unix-second
- *  timestamps an address accumulates fit in a double, and React cannot render a bigint. */
-type AsNumbers<T> = { [K in keyof T]: bigint extends T[K] ? number : T[K] };
-
-/** A half-card as read from chain: the shared contract mirror, minus the `claim_hash` the
- *  claim funnel never shows, with every u64 widened for the UI. Derived rather than
- *  re-declared, so a contract change that misses this file fails `tsc` here. */
-export type VouchView = Omit<AsNumbers<Vouch>, 'claim_hash'>;
-
-/** Aggregate profile shape from the on-chain get_profile view — the same narrowing. */
-export type ProfileView = AsNumbers<Profile>;
+/** A half-card as read from chain, and the get_profile aggregate — the SDK's shapes. */
+export type { ProfileView, VouchView };
 
 const pendingProfiles = new Map<string, Promise<ProfileView>>();
 
-/** `get_profile(addr)` — single round-trip for social + earned + verified. Widgets that
- *  mount together (profile header + badge row, stat strip + badge row) share one read.
- *  Rejects rather than defaulting, so a shape this client can't decode shows as an error
- *  instead of a fake 0 — same rule as `getBadges`. */
+/** `get_profile(addr)` via the SDK — single round-trip for social + earned + verified (the
+ *  three views it composes on a contract that predates it). Widgets that mount together
+ *  (profile header + badge row, stat strip + badge row) share one read. */
 export function getProfile(address: string): Promise<ProfileView> {
-  return shareInFlight(pendingProfiles, address, async () => {
-    const p = decodeProfile(await readPublic(repId(), 'get_profile', [args.addr(address)]));
-    return {
-      social: Number(p.social),
-      earned: Number(p.earned),
-      verified: p.verified,
-    };
-  });
+  return shareInFlight(pendingProfiles, address, () => readClient().getProfile(address));
 }
 
 /** How many distinct people vouched for an address, and how many it vouched for. */
@@ -271,24 +255,9 @@ export async function claimVouch(wallet: Wallet, vouchId: number, secretHex: str
 const pendingVouches = new Map<string, Promise<VouchView | null>>();
 
 /** Read a half-card by id (no wallet needed — used by the logged-out claim funnel).
- *  Dashboard cards that scan the same stored vouches at once share each read. Resolves
- *  `null` for an id that was never minted. */
+ *  Dashboard cards that scan the same stored vouches at once share each read. */
 export function getVouch(vouchId: number): Promise<VouchView | null> {
-  return shareInFlight(pendingVouches, String(vouchId), async () => {
-    const raw = await readPublic(repId(), 'get_vouch', [args.u64(vouchId)]);
-    const v = decodeVouch(raw);
-    if (!v) return null;
-    return {
-      id: Number(v.id),
-      from: v.from,
-      note: v.note,
-      claimed: v.claimed,
-      claimer: v.claimer,
-      created: Number(v.created),
-      stake: Number(v.stake),
-      slashed: v.slashed,
-    };
-  });
+  return shareInFlight(pendingVouches, String(vouchId), () => readClient().getVouch(vouchId));
 }
 
 /** A 2nd-order voucher bonus queued on a claimer — mirror of the contract's PendingBonus. */
@@ -311,19 +280,15 @@ export async function getPending(claimer: string): Promise<PendingBonusView[]> {
   return (list ?? []).map((p) => ({ voucher: String(p.voucher), amount: Number(p.amount) }));
 }
 
-/** Wallet-free profile aggregator — social + earned for ANY address. Prefers the
- *  single-call get_profile view; falls back to the two parallel legacy calls if
- *  the deployed contract predates get_profile. */
+/** Wallet-free profile aggregator — social + earned for ANY address, from the shared
+ *  `getProfile` read (which covers a contract that predates get_profile). Never rejects:
+ *  an unreadable profile reads as zero. */
 export async function getScores(address: string): Promise<{ social: number; earned: number }> {
   try {
     const p = await getProfile(address);
     return { social: p.social, earned: p.earned };
   } catch {
-    const [s, e] = await Promise.all([
-      readPublic<bigint>(repId(), 'get_score', [args.addr(address)]).catch(() => 0n),
-      readPublic<bigint>(repId(), 'get_earned', [args.addr(address)]).catch(() => 0n),
-    ]);
-    return { social: Number(s ?? 0), earned: Number(e ?? 0) };
+    return { social: 0, earned: 0 };
   }
 }
 
