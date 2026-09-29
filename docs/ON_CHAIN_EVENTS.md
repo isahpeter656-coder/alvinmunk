@@ -1363,6 +1363,23 @@ export const EVENTS = {
 } as const;
 ```
 
+### Reading view structs (`Attestation`, `Vouch`, `Profile`)
+
+`Vouch` and `Profile` mirror the structs above field for field, with every
+`u64`/`i128` a `bigint` (what `scValToNative` hands back), and ship with
+`decodeVouch`/`decodeProfile`. Use those rather than decoding the raw return
+yourself: a `#[contracttype]` struct is `ScVal::Vec` of its fields in
+**declaration order**, and `scValToNative` returns a bare vec as a
+**positional array**, never an object — `Option<T>` as a one-element vec and
+`BytesN<N>` as a vec of one `Bytes`. The decoders apply
+`VOUCH_FIELDS`/`PROFILE_FIELDS` and refuse a struct whose field count moved, so
+a contract change surfaces as an error instead of a field read off the wrong
+index.
+
+`apps/web/src/lib/contract-shapes.test.ts` decodes real `get_vouch` /
+`get_profile` `ScVal` fixtures through them and diffs the field lists against
+this file's contract sources, so a drift on either side fails the build.
+
 ---
 
 ## Versioning & Migration Policy

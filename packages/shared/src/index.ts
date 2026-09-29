@@ -35,6 +35,13 @@ export const EVENTS = {
   REWARD: 'reward',
 } as const;
 
+// ── Mirrors of the on-chain read-view structs ──
+// `Vouch` and `Profile` carry every `u64` as a `bigint`, because that is what
+// `scValToNative` returns for one and a u64 does not fit a JS `number` in general. Narrow at
+// the edge that needs it. `Attestation` is left narrowing its own `timestamp`: it is a unix
+// second count, `getQuestAttestation` already normalises to a number, and callers do
+// arithmetic on it.
+
 // ── Mirror of the on-chain Attestation struct (read-view shape) ──
 export interface Attestation {
   issuer: string; // G... address
@@ -45,7 +52,7 @@ export interface Attestation {
 
 // ── Mirror of the on-chain Vouch struct (read-view shape of `get_vouch`) ──
 export interface Vouch {
-  id: number;
+  id: bigint;
   from: string; // voucher address
   /** sha256(secret) — BytesN<32>; all zeros on a card minted with a claim key
    *  (`mint_vouch_signed`), whose key is read with `get_claim_key` */
@@ -54,16 +61,129 @@ export interface Vouch {
   claimed: boolean;
   /** Option<Address> — null until claimed */
   claimer: string | null;
-  created: number; // ledger timestamp at mint
+  created: bigint; // ledger timestamp at mint
   /** Social XP escrowed at mint */
-  stake: number;
+  stake: bigint;
   slashed: boolean;
 }
 
+/** Mirror of the on-chain `Profile` struct — all of `get_profile`, nothing else. Frozen
+ *  (docs/ON_CHAIN_EVENTS.md): Soroban decodes a struct only when the returned vec has
+ *  exactly its fields, so new per-address data ships as its own view, like `get_counts`. */
 export interface Profile {
-  address: string;
-  score: bigint;
-  attestations: Partial<Record<SchemaId, Attestation>>;
+  /** Social XP — leaderboard/fun, never cashable */
+  social: bigint;
+  /** Earned XP — the only track Rewards may gate USDC on */
+  earned: bigint;
+  /** true once the address has done at least one Earned (verified) action */
+  verified: boolean;
+}
+
+/**
+ * The DECLARATION order of each mirror's fields, which is the order Soroban puts them on
+ * the wire. `#[contracttype]` structs encode as `ScVal::Vec`, and `scValToNative` — the
+ * decode every JS consumer already calls — returns a bare vec as a POSITIONAL array, never
+ * an object: a vec carries no field names, so the SDK cannot invent any. These lists are
+ * therefore the only thing binding these interfaces to the contracts, which is why
+ * `decodeVouch`/`decodeProfile` apply them instead of trusting the caller, and why
+ * `apps/web/src/lib/contract-shapes.test.ts` diffs them against `lib.rs`.
+ */
+export const VOUCH_FIELDS = [
+  'id',
+  'from',
+  'claim_hash',
+  'note',
+  'claimed',
+  'claimer',
+  'created',
+  'stake',
+  'slashed',
+] as const satisfies readonly (keyof Vouch)[];
+
+export const PROFILE_FIELDS = ['social', 'earned', 'verified'] as const satisfies readonly (
+  keyof Profile
+)[];
+
+/** `Option<T>` is a one-element `Vec`: `[value]`, or `[null]` for `None`. */
+function optionField(raw: unknown, what: string): unknown {
+  return positional(raw, [what])[0] ?? null;
+}
+
+/** `BytesN<N>` is also a `Vec`, wrapping the single `Bytes` it holds. */
+function bytesField(raw: unknown, what: string): Uint8Array {
+  return Uint8Array.from(positional(raw, [what])[0] as Uint8Array);
+}
+
+/**
+ * A struct vec's fields, refused unless there are exactly as many as the mirror declares.
+ * That count is the cheap guard against the drift this package exists to prevent: a struct
+ * that gains a field is a loud failure here, not every field after it read off the wrong
+ * index.
+ */
+function positional(raw: unknown, names: readonly string[]): unknown[] {
+  if (!Array.isArray(raw)) {
+    const what = names.join('/');
+    throw new Error(
+      `${what}: expected a Soroban struct vec, got ${raw === null ? 'null' : typeof raw}`,
+    );
+  }
+  if (raw.length !== names.length) {
+    throw new Error(
+      `${names.join('/')}: contract returned ${raw.length} fields, expected ${names.length}`,
+    );
+  }
+  return raw;
+}
+
+function u64Field(raw: unknown, what: string): bigint {
+  if (typeof raw !== 'bigint') throw new Error(`${what}: expected a u64, got ${typeof raw}`);
+  return raw;
+}
+
+function stringField(raw: unknown, what: string): string {
+  if (typeof raw !== 'string') throw new Error(`${what}: expected a string, got ${typeof raw}`);
+  return raw;
+}
+
+/**
+ * Decode a `get_vouch` return value — what `scValToNative` hands back for
+ * `Option<Vouch>` — into {@link Vouch}, or `null` for an id that was never minted. Strict
+ * on purpose: a shape that no longer matches the contract throws instead of quietly
+ * reading a field off the wrong index.
+ */
+export function decodeVouch(raw: unknown): Vouch | null {
+  const v = optionField(raw, 'Vouch');
+  if (v === null) return null;
+  const [id, from, claim_hash, note, claimed, rawClaimer, created, stake, slashed] = positional(
+    v,
+    VOUCH_FIELDS,
+  );
+  const claimer = optionField(rawClaimer, 'Vouch.claimer');
+  return {
+    id: u64Field(id, 'Vouch.id'),
+    from: stringField(from, 'Vouch.from'),
+    claim_hash: bytesField(claim_hash, 'Vouch.claim_hash'),
+    note: stringField(note, 'Vouch.note'),
+    claimed: Boolean(claimed),
+    claimer: claimer === null ? null : stringField(claimer, 'Vouch.claimer'),
+    created: u64Field(created, 'Vouch.created'),
+    stake: u64Field(stake, 'Vouch.stake'),
+    slashed: Boolean(slashed),
+  };
+}
+
+/**
+ * Decode a `get_profile` return value — the `scValToNative` output for `Profile` — into
+ * {@link Profile}. The address is the argument, never a field: `Profile` carries no
+ * subject of its own.
+ */
+export function decodeProfile(raw: unknown): Profile {
+  const [social, earned, verified] = positional(raw, PROFILE_FIELDS);
+  return {
+    social: u64Field(social, 'Profile.social'),
+    earned: u64Field(earned, 'Profile.earned'),
+    verified: Boolean(verified),
+  };
 }
 
 // ── Network config ──

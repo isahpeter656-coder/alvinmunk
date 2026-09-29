@@ -46,6 +46,7 @@ import {
   getPending,
   getProfile,
   getScores,
+  getVouch,
   VOUCH_NOTE_MAX_BYTES,
   VOUCH_NOTE_MAX_CHARS,
   vouchNoteBytes,
@@ -138,21 +139,22 @@ describe('vouch note limit', () => {
 describe('getProfile', () => {
   beforeEach(() => readPublicMock.mockReset());
 
+  // `get_profile` returns a `#[contracttype]` struct, which Soroban encodes as a positional
+  // vec — the mock returns what `scValToNative` gives a client, not an object.
   it('maps the aggregate view to a typed ProfileView', async () => {
-    readPublicMock.mockResolvedValueOnce({ social: 30n, earned: 50n, verified: true });
+    readPublicMock.mockResolvedValueOnce([30n, 50n, true]);
     const p = await getProfile('GADDR');
     expect(p).toEqual({ social: 30, earned: 50, verified: true });
     expect(readPublicMock).toHaveBeenCalledWith(REP_ID, 'get_profile', expect.any(Array));
   });
 
-  it('defaults missing fields to zero/false', async () => {
+  it('rejects on a decode it cannot trust instead of reporting a fake 0', async () => {
     readPublicMock.mockResolvedValueOnce(undefined);
-    const p = await getProfile('GADDR');
-    expect(p).toEqual({ social: 0, earned: 0, verified: false });
+    await expect(getProfile('GADDR')).rejects.toThrow(/Soroban struct vec/);
   });
 
   it('shares one get_profile read between widgets asking at the same time', async () => {
-    readPublicMock.mockResolvedValue({ social: 1n, earned: 2n, verified: true });
+    readPublicMock.mockResolvedValue([1n, 2n, true]);
     const [a, b] = await Promise.all([getProfile('GADDR'), getProfile('GADDR')]);
     expect(a).toEqual(b);
     expect(readPublicMock).toHaveBeenCalledTimes(1);
@@ -161,11 +163,45 @@ describe('getProfile', () => {
   });
 });
 
+describe('getVouch', () => {
+  beforeEach(() => readPublicMock.mockReset());
+
+  it('maps the half-card vec, widening the u64s for the UI', async () => {
+    const claimHash = Uint8Array.from({ length: 32 }, (_, i) => i);
+    readPublicMock.mockResolvedValueOnce([
+      [16n, 'GALICE', [claimHash], 'thanks!', true, ['GBOB'], 1_758_633_600n, 5n, false],
+    ]);
+    const v = await getVouch(16);
+    expect(v).toEqual({
+      id: 16,
+      from: 'GALICE',
+      note: 'thanks!',
+      claimed: true,
+      claimer: 'GBOB',
+      created: 1_758_633_600,
+      stake: 5,
+      slashed: false,
+    });
+    expect(readPublicMock).toHaveBeenCalledWith(REP_ID, 'get_vouch', [{ __u64: 16 }]);
+  });
+
+  it('is null for an id that was never minted', async () => {
+    readPublicMock.mockResolvedValueOnce([null]);
+    expect(await getVouch(999)).toBeNull();
+  });
+
+  it('shares one read per vouch id', async () => {
+    readPublicMock.mockResolvedValue([null]);
+    await Promise.all([getVouch(7), getVouch(7)]);
+    expect(readPublicMock).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('getScores', () => {
   beforeEach(() => readPublicMock.mockReset());
 
   it('prefers the single get_profile call (1 round-trip)', async () => {
-    readPublicMock.mockResolvedValueOnce({ social: 15n, earned: 5n, verified: false });
+    readPublicMock.mockResolvedValueOnce([15n, 5n, false]);
     const s = await getScores('GADDR');
     expect(s).toEqual({ social: 15, earned: 5 });
     expect(readPublicMock).toHaveBeenCalledTimes(1);
@@ -179,6 +215,14 @@ describe('getScores', () => {
     const s = await getScores('GADDR');
     expect(s).toEqual({ social: 12, earned: 8 });
     expect(readPublicMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('falls back rather than reading an undecipherable get_profile as zero', async () => {
+    readPublicMock
+      .mockResolvedValueOnce(undefined) // a decode it cannot trust
+      .mockResolvedValueOnce(12n)
+      .mockResolvedValueOnce(8n);
+    expect(await getScores('GADDR')).toEqual({ social: 12, earned: 8 });
   });
 });
 

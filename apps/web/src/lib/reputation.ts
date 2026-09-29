@@ -14,6 +14,7 @@ import { buildClaimUrl } from '@alvinmunk/shared';
 import { invokeAndWait, readContract, readPublic, args, repId, questId } from './contracts';
 import { networkPassphrase } from './stellar';
 import { shareInFlight } from './utils';
+import { decodeProfile, decodeVouch, type Profile, type Vouch } from '@alvinmunk/shared';
 import type { Wallet } from './wallet';
 import { SCHEMA, type Attestation } from '@alvinmunk/shared';
 
@@ -51,42 +52,31 @@ export function clampVouchNote(input: string): string {
   return out;
 }
 
-/** A half-card as read from chain (the fields the claim funnel surfaces). */
-export interface VouchView {
-  id: number;
-  from: string;
-  note: string;
-  claimed: boolean;
-  claimer: string | null;
-  /** ledger unix-seconds when the half-card was minted */
-  created: number;
-  /** Social XP the voucher escrowed (refunded on a timely claim, else slashed) */
-  stake: number;
-  slashed: boolean;
-}
+/** Widen every `bigint` of a contract mirror to `number`: the XP totals and unix-second
+ *  timestamps an address accumulates fit in a double, and React cannot render a bigint. */
+type AsNumbers<T> = { [K in keyof T]: bigint extends T[K] ? number : T[K] };
 
-/** Aggregate profile shape from the on-chain get_profile view. */
-export interface ProfileView {
-  social: number;
-  earned: number;
-  verified: boolean;
-}
+/** A half-card as read from chain: the shared contract mirror, minus the `claim_hash` the
+ *  claim funnel never shows, with every u64 widened for the UI. Derived rather than
+ *  re-declared, so a contract change that misses this file fails `tsc` here. */
+export type VouchView = Omit<AsNumbers<Vouch>, 'claim_hash'>;
+
+/** Aggregate profile shape from the on-chain get_profile view — the same narrowing. */
+export type ProfileView = AsNumbers<Profile>;
 
 const pendingProfiles = new Map<string, Promise<ProfileView>>();
 
 /** `get_profile(addr)` — single round-trip for social + earned + verified. Widgets that
- *  mount together (profile header + badge row, stat strip + badge row) share one read. */
+ *  mount together (profile header + badge row, stat strip + badge row) share one read.
+ *  Rejects rather than defaulting, so a shape this client can't decode shows as an error
+ *  instead of a fake 0 — same rule as `getBadges`. */
 export function getProfile(address: string): Promise<ProfileView> {
   return shareInFlight(pendingProfiles, address, async () => {
-    const p = await readPublic<{ social: bigint; earned: bigint; verified: boolean } | undefined>(
-      repId(),
-      'get_profile',
-      [args.addr(address)],
-    );
+    const p = decodeProfile(await readPublic(repId(), 'get_profile', [args.addr(address)]));
     return {
-      social: Number(p?.social ?? 0),
-      earned: Number(p?.earned ?? 0),
-      verified: Boolean(p?.verified ?? false),
+      social: Number(p.social),
+      earned: Number(p.earned),
+      verified: p.verified,
     };
   });
 }
@@ -252,26 +242,19 @@ export async function claimVouch(wallet: Wallet, vouchId: number, secretHex: str
 const pendingVouches = new Map<string, Promise<VouchView | null>>();
 
 /** Read a half-card by id (no wallet needed — used by the logged-out claim funnel).
- *  Dashboard cards that scan the same stored vouches at once share each read. */
+ *  Dashboard cards that scan the same stored vouches at once share each read. Resolves
+ *  `null` for an id that was never minted. */
 export function getVouch(vouchId: number): Promise<VouchView | null> {
   return shareInFlight(pendingVouches, String(vouchId), async () => {
-    const v = await readPublic<{
-      id: bigint;
-      from: string;
-      note: string;
-      claimed: boolean;
-      claimer: string | null;
-      created: bigint;
-      stake: bigint;
-      slashed: boolean;
-    } | null>(repId(), 'get_vouch', [args.u64(vouchId)]);
+    const raw = await readPublic(repId(), 'get_vouch', [args.u64(vouchId)]);
+    const v = decodeVouch(raw);
     if (!v) return null;
     return {
       id: Number(v.id),
       from: v.from,
       note: v.note,
       claimed: v.claimed,
-      claimer: v.claimer ?? null,
+      claimer: v.claimer,
       created: Number(v.created),
       stake: Number(v.stake),
       slashed: v.slashed,
